@@ -3,6 +3,8 @@
 スマートフォンのカメラ映像に、向きセンサー（DeviceOrientation）で 3D の「光の柱」を重ねる Web AR のサンプルです。
 学生作品 [chisasuma42-del/ar-pillar](https://github.com/chisasuma42-del/ar-pillar) の `index.html` の座標計算を見直し、修正したものです。
 
+**デモ：<https://fumiakim.github.io/ar-pillar-sample/>**（スマートフォンで開いてください）
+
 - 開始ボタンを押した時に向いていた方向が「正面」になります（右90°・左90°にも柱があります）
 - 「ここを正面にする」で正面を取り直せます
 - 実景と柱が回転時にずれて“滑る”場合は「画角」スライダーで合わせます（値は端末に保存されます）
