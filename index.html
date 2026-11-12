@@ -20,20 +20,27 @@
     #ui h1 { font-size: 15px; margin: 0 0 2px; color: #00ffff; }
     #ui p { font-size: 12px; margin: 0; color: #ccc; }
 
-    #panel {
+    #bottom {
       position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom));
-      display: flex; flex-wrap: wrap; gap: 8px; align-items: center; z-index: 20;
+      display: flex; flex-direction: column; align-items: flex-start; gap: 8px; z-index: 20; pointer-events: none;
     }
+    #panel { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; pointer-events: auto; }
     #panel button {
       padding: 10px 14px; font-size: 14px; border-radius: 20px; border: 1px solid rgba(255,255,255,.3);
       background: rgba(0,0,0,.6); color: #fff;
     }
+    #panel button.on { border-color: #00ffff; color: #00ffff; }
     #panel label { font-size: 12px; background: rgba(0,0,0,.6); padding: 8px 12px; border-radius: 20px; display: flex; gap: 6px; align-items: center; }
     #panel input[type=range] { width: 110px; }
     #debug {
-      position: fixed; left: 12px; bottom: calc(64px + env(safe-area-inset-bottom));
       background: rgba(0,0,0,.75); padding: 8px 10px; border-radius: 8px;
-      font: 12px/1.45 monospace; color: #0f0; z-index: 20; pointer-events: none; white-space: pre;
+      font: 12px/1.45 monospace; color: #0f0; white-space: pre; max-width: 100%; overflow: hidden;
+    }
+    /* 山マスクの解析画像（稜線表示の時だけ） */
+    #skyline-debug {
+      position: fixed; right: 12px; top: calc(84px + env(safe-area-inset-top)); z-index: 20;
+      width: 30vw; max-width: 180px; image-rendering: pixelated; pointer-events: none;
+      border: 1px solid rgba(255,255,255,.5); border-radius: 4px;
     }
     #start-btn {
       position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
@@ -44,6 +51,7 @@
     .hidden { display: none !important; }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="skyline-mask.js"></script>
 </head>
 <body>
   <div id="stage">
@@ -56,13 +64,18 @@
     <p>開始時に向いていた方向が「正面」になります</p>
   </div>
 
-  <div id="debug">ボタンを押してください</div>
-
-  <div id="panel" class="hidden">
-    <button id="recenter-btn">ここを正面にする</button>
-    <label>画角 <input id="fov" type="range" min="45" max="90" step="1"> <span id="fov-val"></span>°</label>
-    <button id="debug-btn">情報</button>
+  <div id="bottom">
+    <div id="debug">ボタンを押してください</div>
+    <div id="panel" class="hidden">
+      <button id="recenter-btn">ここを正面にする</button>
+      <button id="mask-btn" class="on">山マスク ON</button>
+      <button id="line-btn">稜線表示</button>
+      <button id="clear-btn" class="hidden">稜線を消去</button>
+      <label>画角 <input id="fov" type="range" min="45" max="90" step="1"> <span id="fov-val"></span>°</label>
+      <button id="debug-btn">情報</button>
+    </div>
   </div>
+  <canvas id="skyline-debug" class="hidden"></canvas>
 
   <button id="start-btn">タップして開始</button>
 
@@ -88,6 +101,8 @@
   const video = document.getElementById('camera-video');
   const debugElem = document.getElementById('debug');
   let scene, camera, renderer, clock;
+  let skyline = null;            // 山マスク（skyline-mask.js）
+  const view = { w: 0, h: 0 };   // 表示領域の大きさ（CSS px）
   const pillars = [];
 
   const deviceQ = new THREE.Quaternion();   // 端末の姿勢（センサーの α,β,γ から作る）
@@ -228,6 +243,10 @@
       { x: -150, z: 0,   radius: 4.0, height: 300, color: 0x00e5ff }  // 左
     ].forEach(c => createPillar(c.x, c.z, c.radius, c.height, c.color));
 
+    // 山マスク：カメラ映像の稜線より下では柱を隠す（詳しくは skyline-mask.js）
+    skyline = new SkylineMask({ video, debugCanvas: document.getElementById('skyline-debug') });
+    scene.add(skyline.group);
+
     updateProjection();
     window.addEventListener('resize', updateProjection);
     window.addEventListener('orientationchange', () => setTimeout(updateProjection, 300));
@@ -259,6 +278,7 @@
   function updateProjection() {
     if (!renderer) return;
     const W = stage.clientWidth, H = stage.clientHeight;
+    view.w = W; view.h = H;
     renderer.setSize(W, H, false);
     camera.aspect = W / H;
 
@@ -283,6 +303,21 @@
   document.getElementById('recenter-btn').addEventListener('click', () => { if (hasSensor) recenter(); else drag.yaw = 0; });
   let showDebug = true;
   document.getElementById('debug-btn').addEventListener('click', () => { showDebug = !showDebug; debugElem.classList.toggle('hidden', !showDebug); });
+
+  const maskBtn = document.getElementById('mask-btn');
+  maskBtn.addEventListener('click', () => {
+    skyline.enabled = !skyline.enabled;
+    maskBtn.textContent = '山マスク ' + (skyline.enabled ? 'ON' : 'OFF');
+    maskBtn.classList.toggle('on', skyline.enabled);
+  });
+  const lineBtn = document.getElementById('line-btn');
+  const clearBtn = document.getElementById('clear-btn');
+  lineBtn.addEventListener('click', () => {
+    skyline.showLine = !skyline.showLine;
+    lineBtn.classList.toggle('on', skyline.showLine);
+    clearBtn.classList.toggle('hidden', !skyline.showLine);
+  });
+  clearBtn.addEventListener('click', () => skyline.reset());
 
   // ---------------------------------------------------------------
   // PC 等センサーが無い環境ではドラッグで見回せるようにする（動作確認用）
@@ -315,6 +350,9 @@
     if (firstFrame) { camera.quaternion.copy(targetQ); firstFrame = false; }
     else camera.quaternion.slerp(targetQ, 1 - Math.exp(-dt / SMOOTH_TAU));
 
+    // 山マスク：向きセンサーがある時だけ（向きが分からないと、稜線を方位に直せない）
+    if (hasSensor) skyline.update(dt, deviceQ, yawOffset, camera, view.w, view.h);
+
     pillars.forEach(p => { p.rotation.y += 0.3 * dt; });
     renderer.render(scene, camera);
 
@@ -328,7 +366,8 @@
         `α ${fmt(raw.a)}  β ${fmt(raw.b)}  γ ${fmt(raw.g)}\n` +
         `方位(正面基準) ${fmt(-yaw)}°  仰角 ${fmt(pitch)}°\n` +
         `コンパス ${fmt(raw.heading)}°  画面回転 ${screenAngleDeg}°${IS_APPLE_MOBILE ? '(重力推定)' : ''}\n` +
-        `映像 ${video.videoWidth}x${video.videoHeight}  縦画角 ${camera.fov.toFixed(1)}°`;
+        `映像 ${video.videoWidth}x${video.videoHeight}  縦画角 ${camera.fov.toFixed(1)}°\n` +
+        `山マスク ${skyline.enabled ? 'ON' : 'OFF'}: ${skyline.stats.state}  検出 ${skyline.stats.valid}/${skyline.stats.columns}列  学習 ${skyline.learnedPercent()}%`;
     }
   }
   </script>
