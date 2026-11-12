@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>AR光の柱 修正サンプル</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: sans-serif; color: #fff; }
+    /* 100vh は iOS Safari でアドレスバー分ずれるため、fixed + inset:0 の1つの箱に映像とCGを重ねる */
+    #stage { position: fixed; inset: 0; }
+    #camera-video, #gl { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    #camera-video { object-fit: cover; }
+    #gl { pointer-events: none; }
+
+    #ui {
+      position: fixed; top: calc(12px + env(safe-area-inset-top)); left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,.6); padding: 10px 20px; border-radius: 24px;
+      border: 1px solid rgba(255,255,255,.2); text-align: center; pointer-events: none; z-index: 10; white-space: nowrap;
+    }
+    #ui h1 { font-size: 15px; margin: 0 0 2px; color: #00ffff; }
+    #ui p { font-size: 12px; margin: 0; color: #ccc; }
+
+    #panel {
+      position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom));
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center; z-index: 20;
+    }
+    #panel button {
+      padding: 10px 14px; font-size: 14px; border-radius: 20px; border: 1px solid rgba(255,255,255,.3);
+      background: rgba(0,0,0,.6); color: #fff;
+    }
+    #panel label { font-size: 12px; background: rgba(0,0,0,.6); padding: 8px 12px; border-radius: 20px; display: flex; gap: 6px; align-items: center; }
+    #panel input[type=range] { width: 110px; }
+    #debug {
+      position: fixed; left: 12px; bottom: calc(64px + env(safe-area-inset-bottom));
+      background: rgba(0,0,0,.75); padding: 8px 10px; border-radius: 8px;
+      font: 12px/1.45 monospace; color: #0f0; z-index: 20; pointer-events: none; white-space: pre;
+    }
+    #start-btn {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      padding: 16px 32px; font-size: 18px; font-weight: bold;
+      background: linear-gradient(135deg, #00ffff, #0088ff); color: #000;
+      border: none; border-radius: 50px; box-shadow: 0 0 20px rgba(0,255,255,.5); cursor: pointer; z-index: 100;
+    }
+    .hidden { display: none !important; }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+  <div id="stage">
+    <video id="camera-video" autoplay playsinline muted></video>
+    <canvas id="gl"></canvas>
+  </div>
+
+  <div id="ui">
+    <h1>AR実景合成（修正版）</h1>
+    <p>開始時に向いていた方向が「正面」になります</p>
+  </div>
+
+  <div id="debug">ボタンを押してください</div>
+
+  <div id="panel" class="hidden">
+    <button id="recenter-btn">ここを正面にする</button>
+    <label>画角 <input id="fov" type="range" min="45" max="90" step="1"> <span id="fov-val"></span>°</label>
+    <button id="debug-btn">情報</button>
+  </div>
+
+  <button id="start-btn">タップして開始</button>
+
+  <script>
+  'use strict';
+  const rad = THREE.MathUtils.degToRad;
+  const deg = THREE.MathUtils.radToDeg;
+
+  // ---------------------------------------------------------------
+  // 設定
+  // ---------------------------------------------------------------
+  // カメラ映像の「長辺方向」の画角（度）。iPhone標準(1x)カメラで約65°前後。
+  // 実景とCGが回転時にずれる（CGが滑る）場合はスライダーで合わせる。
+  const settings = { fovLong: 65 };
+  try { const v = parseFloat(localStorage.getItem('ar-fovLong')); if (v) settings.fovLong = v; } catch (e) {}
+  // 回転のなめらかさ（時定数・秒）。大きいほど遅れる＝映像に対してCGが遅れて「泳ぐ」。
+  const SMOOTH_TAU = 0.04;
+
+  // ---------------------------------------------------------------
+  // 状態
+  // ---------------------------------------------------------------
+  const stage = document.getElementById('stage');
+  const video = document.getElementById('camera-video');
+  const debugElem = document.getElementById('debug');
+  let scene, camera, renderer, clock;
+  const pillars = [];
+
+  const deviceQ = new THREE.Quaternion();   // 端末の姿勢（センサーの α,β,γ から作る）
+  const yawOffset = new THREE.Quaternion(); // 「正面」合わせのための水平回転
+  const targetQ = new THREE.Quaternion();
+  let hasSensor = false;     // 有効なセンサー値を1回でも受け取ったか
+  let needRecenter = true;   // 最初の有効値で自動的に正面合わせ
+  let firstFrame = true;
+  const raw = { a: null, b: null, g: null, heading: null };
+
+  // ---------------------------------------------------------------
+  // 端末姿勢 → three.js カメラの向き
+  //   W3C DeviceOrientation の α,β,γ は Z-X'-Y'' 順のオイラー角。
+  //   3つは「同じ瞬間の同じ回転」を表す1組なので、1つだけ別の値（コンパス等）に
+  //   差し替えてはいけない（β≒90°の“立てた持ち方”付近で破綻する）。
+  // ---------------------------------------------------------------
+  const zee = new THREE.Vector3(0, 0, 1);
+  const euler = new THREE.Euler();
+  const qTmp = new THREE.Quaternion();
+  const qCamFix = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)); // 端末の背面(−Z)をカメラ前方へ: X軸 −90°
+
+  function setDeviceQuaternion(out, alpha, beta, gamma, screenAngle) {
+    euler.set(beta, alpha, -gamma, 'YXZ');            // three.js の Y-up 座標系へ並べ替え
+    out.setFromEuler(euler);
+    out.multiply(qCamFix);
+    out.multiply(qTmp.setFromAxisAngle(zee, -screenAngle)); // 画面の回転（横持ち）を補正
+    return out;
+  }
+
+  function getScreenAngle() {
+    if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
+    if (typeof window.orientation === 'number') return window.orientation; // 旧iOS
+    return 0;
+  }
+
+  function handleOrientation(e) {
+    // null（未キャリブレーション・PC等）は 0 扱いせず捨てる。0 にすると一瞬“北”を向いて跳ぶ。
+    if (e.alpha == null || e.beta == null || e.gamma == null) return;
+    raw.a = e.alpha; raw.b = e.beta; raw.g = e.gamma;
+    // iOS のコンパス値は「表示用」にだけ使う。α に代入しない（回転方向が逆＆βγと不整合）。
+    raw.heading = (typeof e.webkitCompassHeading === 'number') ? e.webkitCompassHeading : null;
+
+    setDeviceQuaternion(deviceQ, rad(e.alpha), rad(e.beta), rad(e.gamma), rad(getScreenAngle()));
+    hasSensor = true;
+    if (needRecenter) { recenter(); needRecenter = false; }
+  }
+
+  // 今カメラが向いている水平方向を「正面（−Z）」にする
+  const _v = new THREE.Vector3();
+  function recenter() {
+    _v.set(0, 0, -1).applyQuaternion(deviceQ);              // カメラ前方
+    if (Math.hypot(_v.x, _v.z) < 0.3) {                     // 真下/真上を向いている時は端末の上方向で代用
+      _v.set(0, 1, 0).applyQuaternion(deviceQ);
+    }
+    const yaw = Math.atan2(-_v.x, -_v.z);
+    yawOffset.setFromAxisAngle(THREE.Object3D.DefaultUp, -yaw);
+    firstFrame = true;
+  }
+
+  // ---------------------------------------------------------------
+  // 起動
+  // ---------------------------------------------------------------
+  document.getElementById('start-btn').addEventListener('click', startAR);
+
+  function startAR() {
+    document.getElementById('start-btn').classList.add('hidden');
+    // iOS: requestPermission はタップ処理の中で“同期的に”呼ぶ必要がある
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      DeviceOrientationEvent.requestPermission()
+        .then(res => {
+          if (res === 'granted') window.addEventListener('deviceorientation', handleOrientation, true);
+          else debugElem.textContent = 'センサー許可が拒否されました（ドラッグで見回せます）';
+        })
+        .catch(err => { debugElem.textContent = 'ERROR: ' + err; });
+    } else {
+      window.addEventListener('deviceorientation', handleOrientation, true);
+    }
+    initThree();
+    initCamera();
+    enableDragFallback();
+    document.getElementById('panel').classList.remove('hidden');
+  }
+
+  async function initCamera() {
+    try {
+      video.srcObject = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false
+      });
+    } catch (err) {
+      debugElem.textContent = 'カメラを利用できません: ' + err.name;
+    }
+  }
+
+  function initThree() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(60, 1, 0.1, 2000);
+    camera.position.set(0, 1.6, 0); // 目の高さ
+    renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('gl'), antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    clock = new THREE.Clock();
+
+    // 開始時の正面 = −Z、右 = +X、左 = −X
+    [
+      { x: 0,    z: -60, radius: 2.0, height: 150, color: 0x00ffff }, // 正面
+      { x: 150,  z: 0,   radius: 4.0, height: 300, color: 0x33ffff }, // 右
+      { x: -150, z: 0,   radius: 4.0, height: 300, color: 0x00e5ff }  // 左
+    ].forEach(c => createPillar(c.x, c.z, c.radius, c.height, c.color));
+
+    updateProjection();
+    window.addEventListener('resize', updateProjection);
+    window.addEventListener('orientationchange', () => setTimeout(updateProjection, 300));
+    video.addEventListener('loadedmetadata', updateProjection);
+    video.addEventListener('resize', updateProjection); // 端末回転で映像の縦横が変わる
+    renderer.setAnimationLoop(animate);
+  }
+
+  function createPillar(x, z, radius, height, colorHex) {
+    const group = new THREE.Group();
+    const mat = new THREE.MeshBasicMaterial({ color: colorHex, transparent: true, opacity: 0.6, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false });
+    const cyl = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, height, 32, 1, true), mat);
+    cyl.position.y = height / 2;
+    group.add(cyl);
+    const coreMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false });
+    const core = new THREE.Mesh(new THREE.CylinderGeometry(radius * 0.3, radius * 0.3, height, 16, 1, true), coreMat);
+    core.position.y = height / 2;
+    group.add(core);
+    group.position.set(x, 0, z);
+    scene.add(group);
+    pillars.push(group);
+  }
+
+  // ---------------------------------------------------------------
+  // 画角を「実際に画面に映っているカメラ映像」に合わせる
+  //   object-fit: cover は映像を拡大して端を切り落とすので、
+  //   画面に見えている範囲の角度を焦点距離(px)から計算する。
+  // ---------------------------------------------------------------
+  function updateProjection() {
+    if (!renderer) return;
+    const W = stage.clientWidth, H = stage.clientHeight;
+    renderer.setSize(W, H, false);
+    camera.aspect = W / H;
+
+    let vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) { vw = W > H ? 4 : 3; vh = W > H ? 3 : 4; } // 映像未取得時は 4:3 と仮定
+    const f = (Math.max(vw, vh) / 2) / Math.tan(rad(settings.fovLong) / 2); // 焦点距離（映像px）
+    const scale = Math.max(W / vw, H / vh);                                 // cover の拡大率
+    const visibleH = H / scale;                                             // 画面に見えている映像の高さ（映像px）
+    camera.fov = deg(2 * Math.atan((visibleH / 2) / f));                    // three.js の fov は縦方向
+    camera.updateProjectionMatrix();
+  }
+
+  const fovInput = document.getElementById('fov');
+  const fovVal = document.getElementById('fov-val');
+  fovInput.value = settings.fovLong; fovVal.textContent = settings.fovLong;
+  fovInput.addEventListener('input', () => {
+    settings.fovLong = parseFloat(fovInput.value);
+    fovVal.textContent = settings.fovLong;
+    try { localStorage.setItem('ar-fovLong', settings.fovLong); } catch (e) {}
+    updateProjection();
+  });
+  document.getElementById('recenter-btn').addEventListener('click', () => { if (hasSensor) recenter(); else drag.yaw = 0; });
+  let showDebug = true;
+  document.getElementById('debug-btn').addEventListener('click', () => { showDebug = !showDebug; debugElem.classList.toggle('hidden', !showDebug); });
+
+  // ---------------------------------------------------------------
+  // PC 等センサーが無い環境ではドラッグで見回せるようにする（動作確認用）
+  // ---------------------------------------------------------------
+  const drag = { yaw: 0, pitch: 0, active: false, x: 0, y: 0 };
+  function enableDragFallback() {
+    stage.addEventListener('pointerdown', e => { drag.active = true; drag.x = e.clientX; drag.y = e.clientY; });
+    window.addEventListener('pointerup', () => { drag.active = false; });
+    window.addEventListener('pointermove', e => {
+      if (!drag.active || hasSensor) return;
+      drag.yaw += (e.clientX - drag.x) * 0.004;
+      drag.pitch = THREE.MathUtils.clamp(drag.pitch + (e.clientY - drag.y) * 0.004, -1.5, 1.5);
+      drag.x = e.clientX; drag.y = e.clientY;
+    });
+  }
+
+  // ---------------------------------------------------------------
+  // 描画ループ
+  // ---------------------------------------------------------------
+  function animate() {
+    const dt = Math.min(clock.getDelta(), 0.1);
+
+    if (hasSensor) {
+      targetQ.copy(yawOffset).multiply(deviceQ);   // 世界 ← 正面合わせ ← 端末姿勢
+    } else {
+      targetQ.setFromEuler(euler.set(drag.pitch, drag.yaw, 0, 'YXZ'));
+    }
+
+    // フレームレートに依存しない平滑化（毎フレーム0.15固定だと60fpsと30fpsで遅れ方が変わる）
+    if (firstFrame) { camera.quaternion.copy(targetQ); firstFrame = false; }
+    else camera.quaternion.slerp(targetQ, 1 - Math.exp(-dt / SMOOTH_TAU));
+
+    pillars.forEach(p => { p.rotation.y += 0.3 * dt; });
+    renderer.render(scene, camera);
+
+    if (showDebug) {
+      _v.set(0, 0, -1).applyQuaternion(camera.quaternion);
+      const yaw = deg(Math.atan2(-_v.x, -_v.z));            // 正面=0、右=+（時計回り）
+      const pitch = deg(Math.asin(THREE.MathUtils.clamp(_v.y, -1, 1)));
+      const fmt = v => (v == null ? '---' : v.toFixed(1).padStart(6));
+      debugElem.textContent =
+        (hasSensor ? 'センサー: 動作中' : 'センサー: なし（ドラッグで操作）') + '\n' +
+        `α ${fmt(raw.a)}  β ${fmt(raw.b)}  γ ${fmt(raw.g)}\n` +
+        `方位(正面基準) ${fmt(-yaw)}°  仰角 ${fmt(pitch)}°\n` +
+        `コンパス ${fmt(raw.heading)}°  画面回転 ${getScreenAngle()}°\n` +
+        `映像 ${video.videoWidth}x${video.videoHeight}  縦画角 ${camera.fov.toFixed(1)}°`;
+    }
+  }
+  </script>
+</body>
+</html>
