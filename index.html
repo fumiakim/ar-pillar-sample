@@ -52,6 +52,7 @@
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="skyline-mask.js"></script>
+  <script src="light-pillars.js"></script>
 </head>
 <body>
   <div id="stage">
@@ -94,6 +95,16 @@
   // 回転のなめらかさ（時定数・秒）。大きいほど遅れる＝映像に対してCGが遅れて「泳ぐ」。
   const SMOOTH_TAU = 0.04;
 
+  // 光の柱の配置（詳しくは light-pillars.js）。角度は度、方位は 正面 0・右 +90・左 −90。
+  //   top: 上端の仰角 [端の柱, 中央の柱] / width: 芯の太さ / distance: 距離[m]（山マスクの壁 50m より遠く）
+  const PILLAR_GROUPS = [
+    { azimuth: 0,   spread: 40, count: 22, distance: [300, 900], top: [25, 70], width: [0.2, 0.6], brightness: [0.2, 0.9] }, // 正面
+    { azimuth: 90,  spread: 14, count: 7,  distance: [300, 900], top: [20, 45], width: [0.2, 0.5], brightness: [0.2, 0.8] }, // 右
+    { azimuth: -90, spread: 14, count: 7,  distance: [300, 900], top: [20, 45], width: [0.2, 0.5], brightness: [0.2, 0.8] }, // 左
+  ];
+  // 演出の強さ：ゆらぎ（0 = 止める〜1）、粒子の量（倍率）、粒子の大きさ（px）
+  const PILLAR_STYLE = { shimmer: 1, particleDensity: 1, particleSize: 5 };
+
   // ---------------------------------------------------------------
   // 状態
   // ---------------------------------------------------------------
@@ -102,8 +113,8 @@
   const debugElem = document.getElementById('debug');
   let scene, camera, renderer, clock;
   let skyline = null;            // 山マスク（skyline-mask.js）
+  let lightPillars = null;       // 光の柱（light-pillars.js）
   const view = { w: 0, h: 0 };   // 表示領域の大きさ（CSS px）
-  const pillars = [];
 
   const deviceQ = new THREE.Quaternion();   // 端末の姿勢（センサーの α,β,γ から作る）
   const yawOffset = new THREE.Quaternion(); // 「正面」合わせのための水平回転
@@ -230,18 +241,16 @@
 
   function initThree() {
     scene = new THREE.Scene();
-    camera = new THREE.PerspectiveCamera(60, 1, 0.1, 2000);
+    // 柱は数百m先で高さ数km になるので、描画する距離の上限（far）を大きくとる
+    camera = new THREE.PerspectiveCamera(60, 1, 0.5, 10000);
     camera.position.set(0, 1.6, 0); // 目の高さ
     renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('gl'), antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     clock = new THREE.Clock();
 
-    // 開始時の正面 = −Z、右 = +X、左 = −X
-    [
-      { x: 0,    z: -60, radius: 2.0, height: 150, color: 0x00ffff }, // 正面
-      { x: 150,  z: 0,   radius: 4.0, height: 300, color: 0x33ffff }, // 右
-      { x: -150, z: 0,   radius: 4.0, height: 300, color: 0x00e5ff }  // 左
-    ].forEach(c => createPillar(c.x, c.z, c.radius, c.height, c.color));
+    // 光の柱（開始時の正面 = −Z、右 = +X、左 = −X）
+    lightPillars = new LightPillars(Object.assign({ groups: PILLAR_GROUPS }, PILLAR_STYLE));
+    scene.add(lightPillars.group);
 
     // 山マスク：カメラ映像の稜線より下では柱を隠す（詳しくは skyline-mask.js）
     skyline = new SkylineMask({ video, debugCanvas: document.getElementById('skyline-debug') });
@@ -253,21 +262,6 @@
     video.addEventListener('loadedmetadata', updateProjection);
     video.addEventListener('resize', updateProjection); // 端末回転で映像の縦横が変わる
     renderer.setAnimationLoop(animate);
-  }
-
-  function createPillar(x, z, radius, height, colorHex) {
-    const group = new THREE.Group();
-    const mat = new THREE.MeshBasicMaterial({ color: colorHex, transparent: true, opacity: 0.6, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false });
-    const cyl = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, height, 32, 1, true), mat);
-    cyl.position.y = height / 2;
-    group.add(cyl);
-    const coreMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false });
-    const core = new THREE.Mesh(new THREE.CylinderGeometry(radius * 0.3, radius * 0.3, height, 16, 1, true), coreMat);
-    core.position.y = height / 2;
-    group.add(core);
-    group.position.set(x, 0, z);
-    scene.add(group);
-    pillars.push(group);
   }
 
   // ---------------------------------------------------------------
@@ -353,7 +347,7 @@
     // 山マスク：向きセンサーがある時だけ（向きが分からないと、稜線を方位に直せない）
     if (hasSensor) skyline.update(dt, deviceQ, yawOffset, camera, view.w, view.h);
 
-    pillars.forEach(p => { p.rotation.y += 0.3 * dt; });
+    lightPillars.update(clock.elapsedTime, renderer.getPixelRatio()); // ゆらぎ・粒子の時刻を進める
     renderer.render(scene, camera);
 
     if (showDebug) {

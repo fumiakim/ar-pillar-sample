@@ -32,11 +32,13 @@
       this.interval = interval;         // 解析の間隔 (秒)
 
       // ---- 調整用の値（明るさは 0〜255） ----
-      this.minDrop = 16;          // 空から地形へ、これ以上暗くなったら境目とみなす
-      this.skyBrightRatio = 0.7;  // 列の一番上が「空らしく明るい」か：画面の明るい所(上位5%)の何割以上か
+      this.minDrop = 16;          // 空から地形へ、これ以上暗くなったら境目とみなす（昼の明るさの場合。暗い映像では自動で小さくする）
+      this.skyBrightRatio = 0.6;  // 列の一番上が「空らしい」か：画面上部の空の明るさの何割以上か
       this.maxTurn = toRad(1.5);  // 解析1回(0.1秒)の間の回転がこれを超えたら学習しない（＝毎秒15°）
       this.maxRollSin = 0.5;      // 横の傾きが 30° を超えたら学習しない
       this.learnRate = 0.35;      // 稜線表を新しい観測へ近づける割合
+      this.minSkylineElev = toRad(-5);   // これより低い稜線は誤検出とみなす
+      this.minSkyBottomElev = toRad(-3); // 画面の下端がこれより低い時は「一番下まで空」を信じない
 
       this.profile = new Float32Array(bins).fill(NaN); // 方位 → 見上げ角 (rad)。NaN は未学習
       this.enabled = true;   // 柱を隠すか
@@ -115,8 +117,11 @@
       for (let i = 0, p = 0; i < L.length; i++, p += 4) L[i] = 0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2];
 
       // 2. 列ごとに稜線を探す
-      const bright = this._percentile(L, 0.95);
-      for (let x = 0; x < aw; x++) this._rows[x] = this._findSkyline(x, aw, ah, bright);
+      //    画面上部（上から1割）の明るい方を「空の明るさ」の目安にする。
+      //    夜の暗い映像では、境目とみなす明るさの差も小さくする
+      const skyRef = this._percentile(L.subarray(0, aw * Math.max(3, Math.round(ah * 0.1))), 0.9);
+      this._drop = Math.max(6, this.minDrop * Math.min(1, Math.max(0.35, skyRef / 160)));
+      for (let x = 0; x < aw; x++) this._rows[x] = this._findSkyline(x, aw, ah, skyRef);
       this._rejectOutliers(aw, ah);
 
       // 3. 稜線の位置 → 方位・見上げ角（画面の点をカメラの向きで世界の方向に直す）
@@ -132,6 +137,12 @@
         const d = this._dir.set((2 * (x + 0.5) / aw - 1) * tanH, (1 - 2 * y / ah) * tanV, -1).normalize().applyQuaternion(q);
         this._th[x] = Math.atan2(d.x, -d.z);                  // 方位（右回りが＋）
         this._ph[x] = Math.asin(Math.max(-1, Math.min(1, d.y))); // 見上げ角
+        // ありえない結果は使わない：地平線よりずっと下の稜線、地平線より下まで「全部空」
+        //（夜に暗い地面だけを見ていると、一様に暗い＝空と取り違えるため）
+        if ((kind === 1 && this._ph[x] < this.minSkylineElev) || (kind === 2 && this._ph[x] < this.minSkyBottomElev)) {
+          this._kind[x] = 0;
+          if (kind === 1) valid--;
+        }
       }
 
       // 4. 隣り合う列の間を方位の刻みに割り振って稜線表を更新（1〜2列の欠けはつなぐ）
@@ -156,11 +167,11 @@
 
     // 1列分：上から下へ見ていき、「空の明るさ」から急に暗くなって、そのまま暗い位置を探す
     // 戻り値：境目の位置（小数の行）／ Infinity（一番下まで空）／ NaN（判断できない）
-    _findSkyline(x, aw, ah, bright) {
-      const L = this._lum;
+    _findSkyline(x, aw, ah, skyRef) {
+      const L = this._lum, minDrop = this._drop;
       const at = (y) => L[y * aw + x];
       const top = (at(0) + at(1) + at(2)) / 3;
-      if (top < bright * this.skyBrightRatio) return NaN;  // 列の一番上が空らしくない（木・建物・地面など）
+      if (top < skyRef * this.skyBrightRatio) return NaN;  // 列の一番上が空らしくない（木・建物・地面など）
 
       const m = Math.max(3, Math.round(ah * 0.04));       // 「暗いまま続く」ことを確かめる長さ
       let slope = 0, rough = 1, worst = 0;
@@ -172,7 +183,7 @@
         rough += 0.2 * (Math.abs(d - slope) - rough);     // 空のざらつき（ノイズ）
         const sky = (at(y - 4) + at(y - 3)) / 2 + 3.5 * slope;
         const next = (at(y) + at(y + 1)) / 2;
-        const T = Math.max(this.minDrop, 4 * rough);
+        const T = Math.max(minDrop, 4 * rough);
         worst = Math.max(worst, sky - next);
         if (sky - next >= T) {
           // 境目の候補。下側がしばらく暗いままか（電線や鳥のような細い物でないか）を確かめる
@@ -200,7 +211,7 @@
       }
       // 境目が無かった：下まで同じように明るければ「全部空」
       const bottom = (at(ah - 1) + at(ah - 2) + at(ah - 3)) / 3;
-      return (worst < 0.5 * this.minDrop && bottom >= 0.9 * top) ? Infinity : NaN;
+      return (worst < 0.5 * minDrop && bottom >= 0.9 * top) ? Infinity : NaN;
     }
 
     // 周りの列と食い違う検出（電柱・雲の切れ端など）を捨てる
