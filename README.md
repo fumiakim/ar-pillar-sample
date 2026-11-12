@@ -91,9 +91,23 @@ camera.quaternion.slerp(targetQuaternion, 0.15);
 映像は `100vh`、WebGL は `window.innerHeight` で大きさを決めていますが、iOS Safari ではアドレスバー分この2つが一致しません。
 映像と canvas を同じ `position: fixed; inset: 0` の箱に入れ、その実寸で描画するようにしました。
 
+### 7. iPad の横持ちで上下と左右が入れ替わる（169行）
+
+```js
+const orient = window.orientation ? THREE.MathUtils.degToRad(window.orientation) : 0;
+```
+
+センサーの α・β・γ は「端末本体（縦持ちが基準）」の向きなので、横持ちで画面が回っている時は画面の回転角で補正する必要があります。
+この角度を 0 と誤ると、カメラの「上」が水平方向を向いた状態（90°ロール）になり、**左右に振ると柱が上下に動き、上下に傾けると左右に動きます**。
+
+- iPad の Safari は既定で「Mac 用サイト」として振る舞うため `window.orientation` が存在せず、上のコードでは常に 0 になる
+- Safari では `window.orientation` と `screen.orientation.angle` の符号が逆になる報告もある（[WebKit Bug 254863](https://bugs.webkit.org/show_bug.cgi?id=254863)）
+
+修正版では、iPhone / iPad では API を使わず、**表示が縦長か横長か**と**重力が端末のどちら側に向いているか**から画面の回転角を求めています（`updateScreenAngle()`）。
+左側面が下なら +90°、右側面が下なら −90°。それ以外の端末では `screen.orientation.angle` を使います。
+
 ### その他
 
-- 画面回転は非推奨の `window.orientation` ではなく `screen.orientation.angle` を優先
 - `facingMode: { exact: "environment" }` は PC 等で失敗するため `ideal` に
 - 柱の回転速度を時間ベースに
 

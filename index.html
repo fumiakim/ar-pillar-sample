@@ -109,18 +109,48 @@
   const qTmp = new THREE.Quaternion();
   const qCamFix = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5)); // 端末の背面(−Z)をカメラ前方へ: X軸 −90°
 
-  function setDeviceQuaternion(out, alpha, beta, gamma, screenAngle) {
+  // 端末本体（縦持ちが基準）の姿勢。画面回転の補正はまだ含まない。
+  function setDeviceQuaternion(out, alpha, beta, gamma) {
     euler.set(beta, alpha, -gamma, 'YXZ');            // three.js の Y-up 座標系へ並べ替え
     out.setFromEuler(euler);
     out.multiply(qCamFix);
-    out.multiply(qTmp.setFromAxisAngle(zee, -screenAngle)); // 画面の回転（横持ち）を補正
     return out;
   }
 
-  function getScreenAngle() {
-    if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
-    if (typeof window.orientation === 'number') return window.orientation; // 旧iOS
-    return 0;
+  // ---------------------------------------------------------------
+  // 画面の回転角（横持ち補正）
+  //   これを誤ると画面上で上下と左右が入れ替わる（90°ずれ）か、上下左右が逆になる（180°ずれ）。
+  //   Apple 端末では API が当てにならない：
+  //     ・iPad の Safari は既定で「Mac として」振る舞い、window.orientation が無い
+  //     ・window.orientation と screen.orientation.angle で符号が逆になる報告がある
+  //   そこで Apple 端末では「表示が縦長か横長か」と「重力が端末のどちら側に向いているか」から求める。
+  // ---------------------------------------------------------------
+  const IS_IPAD = /iPad/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const IS_APPLE_MOBILE = IS_IPAD || /iPhone|iPod/.test(navigator.userAgent);
+  let screenAngleDeg = 0;
+  const _g = new THREE.Vector3();
+  const _qInv = new THREE.Quaternion();
+
+  function updateScreenAngle(qDevice) {
+    if (!IS_APPLE_MOBILE) {
+      if (screen.orientation && typeof screen.orientation.angle === 'number') screenAngleDeg = screen.orientation.angle;
+      else if (typeof window.orientation === 'number') screenAngleDeg = window.orientation;
+      else screenAngleDeg = 0;
+      return screenAngleDeg;
+    }
+    // 重力（下向き）を端末座標へ： x=端末の右, y=端末の上（縦持ち基準）
+    _g.set(0, -1, 0).applyQuaternion(_qInv.copy(qDevice).invert());
+    const landscape = window.innerWidth > window.innerHeight;
+    if (landscape) {
+      // 左側面が下 → 反時計回りに倒した横持ち = +90°、右側面が下 = −90°
+      if (Math.abs(_g.x) > 0.2) screenAngleDeg = _g.x < 0 ? 90 : -90;
+      else if (screenAngleDeg % 180 === 0) screenAngleDeg = 90; // 平置き等で判断できない時
+    } else {
+      // 縦長表示。逆さ縦持ちで画面が回るのは iPad のみ
+      if (IS_IPAD && Math.abs(_g.y) > 0.2) screenAngleDeg = _g.y > 0 ? 180 : 0;
+      else if (!IS_IPAD || screenAngleDeg % 180 !== 0) screenAngleDeg = 0;
+    }
+    return screenAngleDeg;
   }
 
   function handleOrientation(e) {
@@ -130,7 +160,9 @@
     // iOS のコンパス値は「表示用」にだけ使う。α に代入しない（回転方向が逆＆βγと不整合）。
     raw.heading = (typeof e.webkitCompassHeading === 'number') ? e.webkitCompassHeading : null;
 
-    setDeviceQuaternion(deviceQ, rad(e.alpha), rad(e.beta), rad(e.gamma), rad(getScreenAngle()));
+    setDeviceQuaternion(deviceQ, rad(e.alpha), rad(e.beta), rad(e.gamma));
+    const angle = updateScreenAngle(deviceQ);
+    deviceQ.multiply(qTmp.setFromAxisAngle(zee, -rad(angle))); // 画面の回転（横持ち）を補正
     hasSensor = true;
     if (needRecenter) { recenter(); needRecenter = false; }
   }
@@ -295,7 +327,7 @@
         (hasSensor ? 'センサー: 動作中' : 'センサー: なし（ドラッグで操作）') + '\n' +
         `α ${fmt(raw.a)}  β ${fmt(raw.b)}  γ ${fmt(raw.g)}\n` +
         `方位(正面基準) ${fmt(-yaw)}°  仰角 ${fmt(pitch)}°\n` +
-        `コンパス ${fmt(raw.heading)}°  画面回転 ${getScreenAngle()}°\n` +
+        `コンパス ${fmt(raw.heading)}°  画面回転 ${screenAngleDeg}°${IS_APPLE_MOBILE ? '(重力推定)' : ''}\n` +
         `映像 ${video.videoWidth}x${video.videoHeight}  縦画角 ${camera.fov.toFixed(1)}°`;
     }
   }
