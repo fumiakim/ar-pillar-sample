@@ -31,7 +31,7 @@
     }
     #panel button.on { border-color: #00ffff; color: #00ffff; }
     #panel label { font-size: 12px; background: rgba(0,0,0,.6); padding: 8px 12px; border-radius: 20px; display: flex; gap: 6px; align-items: center; }
-    #panel input[type=range] { width: 110px; }
+    #panel input[type=range] { width: 90px; }
     #debug {
       background: rgba(0,0,0,.75); padding: 8px 10px; border-radius: 8px;
       font: 12px/1.45 monospace; color: #0f0; white-space: pre; max-width: 100%; overflow: hidden;
@@ -73,6 +73,7 @@
       <button id="line-btn">稜線表示</button>
       <button id="clear-btn" class="hidden">稜線を消去</button>
       <label>画角 <input id="fov" type="range" min="45" max="90" step="1"> <span id="fov-val"></span>°</label>
+      <label>映像 <input id="video-bright" type="range" min="20" max="100" step="5"> <span id="video-bright-val"></span>%</label>
       <button id="debug-btn">情報</button>
     </div>
   </div>
@@ -92,15 +93,20 @@
   // 実景とCGが回転時にずれる（CGが滑る）場合はスライダーで合わせる。
   const settings = { fovLong: 65 };
   try { const v = parseFloat(localStorage.getItem('ar-fovLong')); if (v) settings.fovLong = v; } catch (e) {}
+  // カメラ映像の明るさ（%）。少し暗くすると光の柱が映える。
+  // 表示だけを暗くする（CSS の filter）ので、山マスクの解析は元の明るさのまま行われる。
+  settings.videoBrightness = 70;
+  try { const v = parseFloat(localStorage.getItem('ar-videoBrightness')); if (v) settings.videoBrightness = v; } catch (e) {}
   // 回転のなめらかさ（時定数・秒）。大きいほど遅れる＝映像に対してCGが遅れて「泳ぐ」。
   const SMOOTH_TAU = 0.04;
 
   // 光の柱の配置（詳しくは light-pillars.js）。角度は度、方位は 正面 0・右 +90・左 −90。
+  //   sources: 光源の数 / beams: 1つの光源から出る光の本数 / fan: 外側の光の傾き [小, 大]（扇の開き）
   //   top: 上端の仰角 [端の柱, 中央の柱] / width: 芯の太さ / distance: 距離[m]（山マスクの壁 50m より遠く）
   const PILLAR_GROUPS = [
-    { azimuth: 0,   spread: 40, count: 22, distance: [300, 900], top: [25, 70], width: [0.2, 0.6], brightness: [0.2, 0.9] }, // 正面
-    { azimuth: 90,  spread: 14, count: 7,  distance: [300, 900], top: [20, 45], width: [0.2, 0.5], brightness: [0.2, 0.8] }, // 右
-    { azimuth: -90, spread: 14, count: 7,  distance: [300, 900], top: [20, 45], width: [0.2, 0.5], brightness: [0.2, 0.8] }, // 左
+    { azimuth: 0,   spread: 40, sources: 10, beams: [2, 3], fan: [1.2, 3], distance: [300, 900], top: [25, 70], width: [0.18, 0.5], brightness: [0.25, 0.9] }, // 正面
+    { azimuth: 90,  spread: 14, sources: 3,  beams: [2, 3], fan: [1.2, 2.5], distance: [300, 900], top: [20, 45], width: [0.18, 0.42], brightness: [0.25, 0.8] }, // 右
+    { azimuth: -90, spread: 14, sources: 3,  beams: [2, 3], fan: [1.2, 2.5], distance: [300, 900], top: [20, 45], width: [0.18, 0.42], brightness: [0.25, 0.8] }, // 左
   ];
   // 演出の強さ：ゆらぎ（0 = 止める〜1）、粒子の量（倍率）、粒子の大きさ（px）
   const PILLAR_STYLE = { shimmer: 1, particleDensity: 1, particleSize: 5 };
@@ -294,6 +300,22 @@
     try { localStorage.setItem('ar-fovLong', settings.fovLong); } catch (e) {}
     updateProjection();
   });
+
+  // カメラ映像の明るさ
+  const brightInput = document.getElementById('video-bright');
+  const brightVal = document.getElementById('video-bright-val');
+  function applyVideoBrightness() {
+    video.style.filter = settings.videoBrightness < 100 ? `brightness(${settings.videoBrightness / 100})` : '';
+    brightInput.value = settings.videoBrightness;
+    brightVal.textContent = settings.videoBrightness;
+  }
+  applyVideoBrightness();
+  brightInput.addEventListener('input', () => {
+    settings.videoBrightness = parseFloat(brightInput.value);
+    applyVideoBrightness();
+    try { localStorage.setItem('ar-videoBrightness', settings.videoBrightness); } catch (e) {}
+  });
+
   document.getElementById('recenter-btn').addEventListener('click', () => { if (hasSensor) recenter(); else drag.yaw = 0; });
   let showDebug = true;
   document.getElementById('debug-btn').addEventListener('click', () => { showDebug = !showDebug; debugElem.classList.toggle('hidden', !showDebug); });

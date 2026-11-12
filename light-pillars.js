@@ -3,20 +3,23 @@
  *
  * 冬の夜、街の灯りが空中の氷の結晶に反射して縦に長く伸びて見える「光柱（ライトピラー）」を表現する。
  *
+ *   ・光源：1か所の光源から 2〜3 本の光が、扇のように少しだけ開いて伸びる
  *   ・柱：カメラの方を向く縦長の板を、シェーダーで光らせる
  *       横方向：細く明るい芯 ＋ 柔らかな光の広がり（ガウス分布を3つ重ねる）＋ 縦の細かな筋
  *       縦方向：根元が明るく、上へ向かってなめらかに薄れて消える
  *       ゆらぎ：上へゆっくり流れる明るさのむら・柱全体の明るさの呼吸・芯のわずかな揺れ・上端の伸び縮み
- *   ・粒子：柱の芯から生まれ、外へ漏れ出すように漂いながら瞬いて消える（位置は時刻から GPU が計算する）
+ *   ・粒子：柱の芯から生まれ、昇りながら広がって（拡散して）、瞬きつつ消える（位置は時刻から GPU が計算する）
  *   ・合成：光を足し合わせ、アルファには明るさを入れる
  *       → カメラ映像の上に「スクリーン合成」のように柔らかく重なる（暗い所ほど光が映える）
  *
  * 配置は「グループ」で指定する（index.html の PILLAR_GROUPS）。角度はすべて度。
  *   azimuth    : グループの中心の方位（正面 0、右 +90、左 −90）
- *   spread     : 左右への広がり（中心ほど本数が多い）
- *   count      : 本数
+ *   spread     : 左右への広がり（中心ほど光源が多い）
+ *   sources    : 光源の数
+ *   beams      : 1つの光源から出る光の本数 [最少, 最多]
+ *   fan        : 扇の開き＝外側の光の傾き [小, 大]（0 にすると平行）
  *   distance   : 距離の範囲 [m]（山マスクの壁 50m より遠くに置く）
- *   top        : 上端の仰角 [端の柱, 中央の柱]（中央ほど高く伸びる）
+ *   top        : 上端の仰角 [端の光源, 中央の光源]（中央ほど高く伸びる）
  *   width      : 芯の太さ [細い, 太い]（見える角度）
  *   brightness : 明るさ [暗い, 明るい]
  *   palette    : 色と出やすさ（省略時は下の PALETTE）
@@ -53,14 +56,27 @@
     }
   `;
 
+  // 板の向き：カメラの方を向き（縦軸まわりだけ回す）、さらに横へ lean だけ傾ける
+  const BEAM_FRAME_GLSL = `
+    // base: 根元, lean: 傾き → axis: 光の伸びる向き, across: 光の幅の向き
+    void beamFrame(vec3 base, float lean, out vec3 axis, out vec3 across) {
+      vec3 toCam = cameraPosition - base;
+      vec3 right = normalize(vec3(toCam.z, 0.0, -toCam.x));
+      float s = sin(lean), c = cos(lean);
+      axis = vec3(0.0, c, 0.0) + right * s;
+      across = right * c - vec3(0.0, s, 0.0);
+    }
+  `;
+
   // ---------------------------------------------------------------
-  // 柱：頂点シェーダー（板をカメラに向け、高さ方向のゆらぎをここで計算して軽くする）
+  // 柱：頂点シェーダー（板の形と、高さ方向のゆらぎをここで計算して軽くする）
   // ---------------------------------------------------------------
   const PILLAR_VS = `
     uniform float uTime;
     uniform float uShimmer;
     attribute vec2 aCorner;   // x: -1 / +1（幅方向）, y: 0〜1（根元→上端）
     attribute vec4 aShape;    // x: 板の半幅[m], y: 高さ[m], z: 芯の太さ（半幅に対する割合）, w: 上端の仰角[rad]
+    attribute float aLean;    // 傾き[rad]
     attribute vec3 aColor;
     attribute vec4 aParam;    // x: 乱数の種, y: 明るさ, z: ゆらぎの速さ, w: 上端が薄れ始める高さ(0〜1)
     varying float vX;
@@ -70,14 +86,14 @@
     varying float vSeed;
     varying vec3 vColor;
     ${NOISE_GLSL}
+    ${BEAM_FRAME_GLSL}
     void main() {
       float seed = aParam.x, t = uTime * aParam.z, y = aCorner.y;
 
-      // 板をカメラの方へ向ける（縦軸まわりだけ回すので、見上げても柱は縦のまま）
       vec3 base = (modelMatrix * vec4(position, 1.0)).xyz;
-      vec3 toCam = cameraPosition - base;
-      vec3 right = normalize(vec3(toCam.z, 0.0, -toCam.x));
-      vec3 p = base + right * (aCorner.x * aShape.x) + vec3(0.0, y * aShape.y, 0.0);
+      vec3 axis, across;
+      beamFrame(base, aLean, axis, across);
+      vec3 p = base + axis * (y * aShape.y / cos(aLean)) + across * (aCorner.x * aShape.x);
       gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
 
       // 高さを「見上げる角度」の割合に直す（0 = 根元、1 = 上端）。画面の上で均等に薄れていくように
@@ -127,38 +143,49 @@
   `;
 
   // ---------------------------------------------------------------
-  // 粒子：柱の芯から外へ漏れ出し、瞬きながら消える
+  // 粒子：柱の芯から生まれ、昇りながら広がり（拡散）、瞬きつつ消える
   // ---------------------------------------------------------------
   const PARTICLE_VS = `
     uniform float uTime;
     uniform float uPixelRatio;
     uniform float uSize;
     attribute vec2 aDims;     // x: 柱の板の半幅[m], y: 柱の高さ[m]
+    attribute float aLean;    // 柱の傾き[rad]
     attribute vec3 aColor;
     attribute vec4 aRand;     // 粒子ごとの乱数
+    attribute vec4 aRand2;
     varying vec3 vColor;
     varying float vAlpha;
+    ${BEAM_FRAME_GLSL}
     void main() {
-      float life = mix(4.0, 9.0, aRand.x);                // 生まれてから消えるまで（秒）
+      float life = mix(5.0, 10.0, aRand.x);               // 生まれてから消えるまで（秒）
       float ph = fract(uTime / life + aRand.y);           // 0→1：一生のどこにいるか
       vec3 base = (modelMatrix * vec4(position, 1.0)).xyz;
-      vec3 toCam = cameraPosition - base;
-      vec3 right = normalize(vec3(toCam.z, 0.0, -toCam.x));
+      vec3 axis, across;
+      beamFrame(base, aLean, axis, across);
+      vec3 toward = normalize(vec3(cameraPosition.x - base.x, 0.0, cameraPosition.z - base.z));
 
-      float h = pow(aRand.z, 1.7) * 0.8;                  // 生まれる高さ（明るい根元寄り）
+      // 生まれる場所：柱の芯の上（明るい根元寄り）
+      float h = pow(aRand.z, 1.6) * 0.75;
+      vec3 p = base + axis * (h * aDims.y / cos(aLean));
+      // 昇る：少しずつ速くなりながら上へ
+      float rise = (ph + 0.6 * ph * ph) / 1.6 * mix(0.08, 0.25, aRand2.x) * aDims.y;
+      // 拡散：昇るほど広がる（広がる向きはゆっくり回る）
+      float spread = pow(ph, 0.8) * mix(0.10, 0.45, aRand2.y) * aDims.x;
+      float ang = aRand2.z * 6.2832 + uTime * (aRand2.w - 0.5) * 0.6;
+      // 芯から左右どちらかへ漏れ出す動きと、小さな揺れ
       float side = aRand.w < 0.5 ? -1.0 : 1.0;
-      float drift = side * ph * mix(0.04, 0.25, fract(aRand.w * 7.31)) * aDims.x;   // 芯から外へ漏れ出す
-      float wob = sin(uTime * mix(0.8, 1.6, aRand.x) + aRand.y * 40.0) * 0.02 * aDims.x; // ゆらゆら
-      float rise = ph * mix(0.01, 0.06, fract(aRand.z * 13.7)) * aDims.y;               // ゆっくり昇る
-      vec3 p = base + right * (drift + wob) + vec3(0.0, h * aDims.y + rise, 0.0);
+      float leak = side * ph * mix(0.03, 0.12, fract(aRand.w * 7.31)) * aDims.x;
+      float wob = sin(uTime * mix(0.8, 1.6, aRand.x) + aRand.y * 40.0) * 0.02 * aDims.x;
+      p += vec3(0.0, rise, 0.0) + across * (leak + wob + cos(ang) * spread) + toward * (sin(ang) * spread);
       vec4 mv = viewMatrix * vec4(p, 1.0);
       gl_Position = projectionMatrix * mv;
 
-      float fade = smoothstep(0.0, 0.12, ph) * (1.0 - smoothstep(0.5, 1.0, ph));
+      float fade = smoothstep(0.0, 0.1, ph) * (1.0 - smoothstep(0.45, 1.0, ph)); // 現れて、広がりながら消える
       float tw = pow(0.5 + 0.5 * sin(uTime * mix(3.0, 8.0, fract(aRand.y * 5.7)) + aRand.z * 50.0), 2.0); // 瞬き
-      vAlpha = fade * (0.3 + 0.7 * tw) * (1.0 - 0.6 * h);
+      vAlpha = fade * (0.3 + 0.7 * tw) * (1.0 - 0.5 * h);
       vColor = mix(aColor, vec3(1.0), 0.5);
-      gl_PointSize = uSize * mix(0.6, 1.3, fract(aRand.w * 3.3)) * uPixelRatio;
+      gl_PointSize = uSize * mix(0.6, 1.3, fract(aRand.w * 3.3)) * (0.8 + 0.5 * ph) * uPixelRatio; // 広がるほど少し大きく
     }
   `;
 
@@ -196,35 +223,52 @@
   }
   const lerp = (a, b, t) => a + (b - a) * t;
 
-  // グループの設定から、柱を1本ずつ作る
+  // グループの設定から、光源ごとに 2〜3 本の光を作る
   function generatePillars(groups, seed) {
     const rnd = makeRandom(seed), list = [];
+    const c = new THREE.Color(), white = new THREE.Color(1, 1, 1);
     for (const g of groups) {
       const palette = g.palette || PALETTE;
       const total = palette.reduce((s, p) => s + p.weight, 0);
-      for (let i = 0; i < g.count; i++) {
+      const beams = g.beams || [2, 3], fanRange = g.fan || [1.2, 3];
+      const sources = g.sources ?? g.count ?? 10;
+      for (let i = 0; i < sources; i++) {
+        // 光源（1か所）
         const u = (rnd() + rnd() + rnd()) / 1.5 - 1;   // −1〜1（中央ほど多い）
         const center = 1 - Math.abs(u);
-        const brightness = lerp(g.brightness[0], g.brightness[1], Math.pow(rnd(), 2.0)); // 明るい柱は少なめ
-        let pick = rnd() * total, color = palette[0].color;
-        for (const p of palette) { if ((pick -= p.weight) <= 0) { color = p.color; break; } }
-        list.push({
-          azimuth: g.azimuth + u * g.spread,
-          distance: lerp(g.distance[0], g.distance[1], rnd()),
-          top: Math.min(80, lerp(g.top[0], g.top[1], Math.pow(center, 0.7)) + (rnd() - 0.5) * (g.topJitter ?? 12)),
-          width: lerp(g.width[0], g.width[1], 0.4 * rnd() + 0.6 * brightness), // 明るい柱ほど太め
-          brightness,
-          color,
-          seed: rnd() * 100,
-          speed: lerp(0.7, 1.3, rnd()),
-          fadeStart: lerp(0.35, 0.65, rnd()),
-        });
+        const azimuth = g.azimuth + u * g.spread;
+        const distance = lerp(g.distance[0], g.distance[1], rnd());
+        const brightness = lerp(g.brightness[0], g.brightness[1], Math.pow(rnd(), 2.0)); // 明るい光源は少なめ
+        const top = Math.min(80, lerp(g.top[0], g.top[1], Math.pow(center, 0.7)) + (rnd() - 0.5) * (g.topJitter ?? 12));
+        const width = lerp(g.width[0], g.width[1], 0.4 * rnd() + 0.6 * brightness); // 明るいほど太め
+        let pick = rnd() * total, hex = palette[0].color;
+        for (const p of palette) { if ((pick -= p.weight) <= 0) { hex = p.color; break; } }
+
+        // その光源から出る 2〜3 本の光：扇のように少しずつ傾け、1本を主役（一番明るく高い）にする
+        const n = Math.max(1, Math.round(lerp(beams[0], beams[1], rnd())));
+        const fan = lerp(fanRange[0], fanRange[1], rnd());
+        const main = Math.floor(rnd() * n);
+        for (let b = 0; b < n; b++) {
+          const isMain = b === main;
+          c.setHex(hex).lerp(white, rnd() * 0.25);       // 同じ光源の色を少しずつ変える
+          list.push({
+            azimuth, distance,
+            lean: n > 1 ? fan * (2 * b / (n - 1) - 1) + (rnd() - 0.5) * 0.6 : 0,
+            top: isMain ? top : top * lerp(0.7, 0.95, rnd()),
+            width: width * lerp(0.75, 1.05, rnd()),
+            brightness: brightness * (isMain ? 1 : lerp(0.5, 0.85, rnd())),
+            color: [c.r, c.g, c.b],
+            seed: rnd() * 100,
+            speed: lerp(0.7, 1.3, rnd()),
+            fadeStart: lerp(0.35, 0.65, rnd()),
+          });
+        }
       }
     }
     return list;
   }
 
-  // 柱1本の、世界座標での大きさ
+  // 光1本の、世界座標での大きさ
   function measure(p) {
     const az = p.azimuth * D2R, d = p.distance;
     const coreSigma = d * Math.tan(p.width * D2R / 2);  // 芯の太さ [m]
@@ -233,11 +277,12 @@
       halfW: coreSigma * 20,                              // 板の半幅：芯の20倍まで光を広げる
       height: d * Math.tan(p.top * D2R),
       top: p.top * D2R,
+      lean: p.lean * D2R,
     };
   }
 
   class LightPillars {
-    constructor({ groups, seed = 7, shimmer = 1, particleDensity = 1, particleSize = 6, segments = 96 } = {}) {
+    constructor({ groups, seed = 7, shimmer = 1, particleDensity = 1, particleSize = 5, segments = 96 } = {}) {
       this.pillars = generatePillars(groups, seed);
       this.group = new THREE.Group();
       this.uTime = { value: 0 };
@@ -259,20 +304,19 @@
 
     _buildPillars(segments) {
       const n = this.pillars.length, vpp = (segments + 1) * 2; // 1本あたりの頂点数（高さ方向に細かく分ける）
-      const pos = new Float32Array(n * vpp * 3), corner = new Float32Array(n * vpp * 2);
+      const pos = new Float32Array(n * vpp * 3), corner = new Float32Array(n * vpp * 2), lean = new Float32Array(n * vpp);
       const shape = new Float32Array(n * vpp * 4), color = new Float32Array(n * vpp * 3), param = new Float32Array(n * vpp * 4);
       const index = [];
-      const c = new THREE.Color();
       this.pillars.forEach((p, k) => {
         const m = measure(p);
-        c.setHex(p.color);
         for (let s = 0; s <= segments; s++) {
           for (let side = 0; side < 2; side++) {
             const v = k * vpp + s * 2 + side;
             pos.set([m.x, 0, m.z], v * 3);                 // 根元（地面）の位置
             corner.set([side ? 1 : -1, s / segments], v * 2);
             shape.set([m.halfW, m.height, 1 / 20, m.top], v * 4);
-            color.set([c.r, c.g, c.b], v * 3);
+            lean[v] = m.lean;
+            color.set(p.color, v * 3);
             param.set([p.seed, p.brightness, p.speed, p.fadeStart], v * 4);
           }
         }
@@ -285,6 +329,7 @@
       geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       geo.setAttribute('aCorner', new THREE.BufferAttribute(corner, 2));
       geo.setAttribute('aShape', new THREE.BufferAttribute(shape, 4));
+      geo.setAttribute('aLean', new THREE.BufferAttribute(lean, 1));
       geo.setAttribute('aColor', new THREE.BufferAttribute(color, 3));
       geo.setAttribute('aParam', new THREE.BufferAttribute(param, 4));
       geo.setIndex(index);
@@ -297,27 +342,30 @@
     }
 
     _buildParticles(density) {
-      const counts = this.pillars.map(p => Math.round((8 + 24 * p.brightness) * density)); // 明るい柱ほど多く漏れる
+      const counts = this.pillars.map(p => Math.round((20 + 50 * p.brightness) * density)); // 明るい光ほど多く漏れる
       const total = counts.reduce((a, b) => a + b, 0);
-      const pos = new Float32Array(total * 3), dims = new Float32Array(total * 2);
-      const color = new Float32Array(total * 3), rand = new Float32Array(total * 4);
-      const rnd = makeRandom(12345), c = new THREE.Color();
+      const pos = new Float32Array(total * 3), dims = new Float32Array(total * 2), lean = new Float32Array(total);
+      const color = new Float32Array(total * 3), rand = new Float32Array(total * 4), rand2 = new Float32Array(total * 4);
+      const rnd = makeRandom(12345);
       let i = 0;
       this.pillars.forEach((p, k) => {
-        const m = measure(p);
-        c.setHex(p.color).multiplyScalar(0.4 + 0.6 * p.brightness); // 暗い柱の粒子は暗く
+        const m = measure(p), dim = 0.4 + 0.6 * p.brightness; // 暗い光の粒子は暗く
         for (let j = 0; j < counts[k]; j++, i++) {
           pos.set([m.x, 0, m.z], i * 3);
           dims.set([m.halfW, m.height], i * 2);
-          color.set([c.r, c.g, c.b], i * 3);
+          lean[i] = m.lean;
+          color.set([p.color[0] * dim, p.color[1] * dim, p.color[2] * dim], i * 3);
           rand.set([rnd(), rnd(), rnd(), rnd()], i * 4);
+          rand2.set([rnd(), rnd(), rnd(), rnd()], i * 4);
         }
       });
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       geo.setAttribute('aDims', new THREE.BufferAttribute(dims, 2));
+      geo.setAttribute('aLean', new THREE.BufferAttribute(lean, 1));
       geo.setAttribute('aColor', new THREE.BufferAttribute(color, 3));
       geo.setAttribute('aRand', new THREE.BufferAttribute(rand, 4));
+      geo.setAttribute('aRand2', new THREE.BufferAttribute(rand2, 4));
       const mat = new THREE.ShaderMaterial(Object.assign({
         uniforms: this.particleUniforms, vertexShader: PARTICLE_VS, fragmentShader: PARTICLE_FS,
       }, ADDITIVE));
